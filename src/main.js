@@ -238,7 +238,10 @@ let globalStats = {
   netWpm: 0,
   accuracy: 0,
   sessionsCompleted: 0,
-  maxCombo: 0
+  maxCombo: 0,
+  totalRawWpm: 0,
+  totalNetWpm: 0,
+  totalAccuracy: 0
 };
 
 let missedKeysGlobal = {};
@@ -252,6 +255,7 @@ let currentCombo = 0;
 let sessionMaxCombo = 0;
 let sessionMissedKeys = {};
 let timerInterval = null;
+let resultsTimeout = null;
 
 let currentAIStyle = 'neon';
 
@@ -266,16 +270,42 @@ const KEYBOARD_LAYOUTS = {
   eu: [['1','2','3','4','5','6','7','8','9','0'],['Q','W','E','R','T','Y','U','I','O','P'],['A','S','D','F','G','H','J','K','L'],['Z','X','C','V','B','N','M'],['SPACE']]
 };
 
+const keyboardDataKeyCache = new Map();
+
+const IGNORED_TYPING_KEYS = new Set([
+  'Alt',
+  'AltGraph',
+  'ArrowDown',
+  'ArrowLeft',
+  'ArrowRight',
+  'ArrowUp',
+  'Backspace',
+  'CapsLock',
+  'Control',
+  'Dead',
+  'Delete',
+  'End',
+  'Enter',
+  'Escape',
+  'Home',
+  'Insert',
+  'Meta',
+  'PageDown',
+  'PageUp',
+  'Shift',
+  'Tab'
+]);
+
 let currentLanguage = 'es';
 
 window.changeLanguage = (lang) => {
+  const activeSessionId = currentSession?.id ?? null;
   currentLanguage = lang;
-  // Reset sessions tracking if needed or just let them stay unlocked
-  if (!currentSession) {
+
+  if (activeSessionId === null) {
     renderDashboard();
   } else {
-    // If mid-session, we might want to restart with the new language text
-    startSession(currentSession.id);
+    startSession(activeSessionId);
   }
 };
 
@@ -294,6 +324,64 @@ function getRandomMsg(type) {
   const profile = AI_PROFILES[currentAIStyle];
   const msgs = profile[type];
   return msgs[Math.floor(Math.random() * msgs.length)];
+}
+
+function stopActiveSession() {
+  clearInterval(timerInterval);
+  timerInterval = null;
+  clearTimeout(resultsTimeout);
+  resultsTimeout = null;
+  document.removeEventListener('keydown', handleTyping);
+}
+
+function resetPracticeState() {
+  typedText = '';
+  startTime = null;
+  errors = 0;
+  currentCombo = 0;
+  sessionMaxCombo = 0;
+  sessionMissedKeys = {};
+}
+
+function normalizeText(value) {
+  return value.normalize('NFC');
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function getLayoutDataKeys(language) {
+  if (!keyboardDataKeyCache.has(language)) {
+    const layoutKeys = new Set(
+      (KEYBOARD_LAYOUTS[language] || KEYBOARD_LAYOUTS.es)
+        .flat()
+        .map(layoutKey => layoutKey === 'SPACE' ? 'space' : layoutKey.toLowerCase())
+    );
+    keyboardDataKeyCache.set(language, layoutKeys);
+  }
+
+  return keyboardDataKeyCache.get(language);
+}
+
+function getKeyboardDataKey(char) {
+  if (char === ' ') return 'space';
+
+  const key = char.toLowerCase();
+  const layoutKeys = getLayoutDataKeys(currentLanguage);
+
+  if (layoutKeys.has(key)) return key;
+
+  return key.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+function bindClick(id, handler) {
+  document.getElementById(id)?.addEventListener('click', handler);
 }
 
 let mascotTimer = null;
@@ -329,11 +417,16 @@ function renderDashboard() {
   const sessions = ALL_SESSIONS[currentLanguage];
 
   let sessionsHTML = sessions.map(s => `
-    <div class="card ${s.unlocked ? 'unlocked' : 'locked'}" ${s.unlocked ? `onclick="startSession(${s.id})"` : ''}>
-      <h3 style="color:var(--primary); margin-bottom: 0.5rem;">${t.itemsInGrid || 'Session'} ${s.id}</h3>
-      <p style="margin-bottom: 0.5rem;">${s.title}</p>
-      ${!s.unlocked ? `<span style="color:var(--on-surface-variant)">${t.locked}</span>` : ''}
-    </div>
+    <button
+      class="card session-card ${s.unlocked ? 'unlocked' : 'locked'}"
+      type="button"
+      data-session-id="${s.id}"
+      ${s.unlocked ? '' : 'disabled aria-disabled="true"'}
+    >
+      <span class="session-number">${escapeHtml(t.itemsInGrid || 'Session')} ${s.id}</span>
+      <span class="session-title">${escapeHtml(s.title)}</span>
+      ${!s.unlocked ? `<span class="session-lock">${escapeHtml(t.locked)}</span>` : ''}
+    </button>
   `).join('');
 
   const sortedProblemKeys = Object.entries(missedKeysGlobal)
@@ -344,9 +437,9 @@ function renderDashboard() {
   if (sortedProblemKeys.length > 0) {
     problemKeysHTML = `
       <div style="margin-top:1rem;">
-        <p style="color:var(--on-surface-variant); font-size:0.9rem;">${t.problemKeys}</p>
+        <p style="color:var(--on-surface-variant); font-size:0.9rem;">${escapeHtml(t.problemKeys)}</p>
         <div class="problem-keys-container">
-          ${sortedProblemKeys.map(([k, count]) => `<div class="problem-key-badge">${k === ' ' ? 'SPACE' : k.toUpperCase()} (${count})</div>`).join('')}
+          ${sortedProblemKeys.map(([k, count]) => `<div class="problem-key-badge">${escapeHtml(k === ' ' ? 'SPACE' : k.toUpperCase())} (${count})</div>`).join('')}
         </div>
       </div>
     `;
@@ -355,7 +448,8 @@ function renderDashboard() {
   app.innerHTML = `
     <div class="header-controls">
       <div class="control-group">
-        <select id="lang-selector" onchange="changeLanguage(this.value)">
+        <label for="lang-selector" class="sr-only">${escapeHtml(t.langLabel)}</label>
+        <select id="lang-selector">
           <option value="es" ${currentLanguage === 'es' ? 'selected' : ''}>Español</option>
           <option value="en" ${currentLanguage === 'en' ? 'selected' : ''}>English</option>
           <option value="gl" ${currentLanguage === 'gl' ? 'selected' : ''}>Galego</option>
@@ -367,7 +461,8 @@ function renderDashboard() {
         </select>
       </div>
       <div class="control-group">
-        <select id="ai-selector" onchange="changeAIStyle(this.value)">
+        <label for="ai-selector" class="sr-only">${escapeHtml(t.aiLabel)}</label>
+        <select id="ai-selector">
           <option value="neon" ${currentAIStyle === 'neon' ? 'selected' : ''}>Neon-Bot</option>
           <option value="zen" ${currentAIStyle === 'zen' ? 'selected' : ''}>Zen-AI</option>
           <option value="sarcastic" ${currentAIStyle === 'sarcastic' ? 'selected' : ''}>Sarcastic-OS</option>
@@ -376,32 +471,42 @@ function renderDashboard() {
     </div>
 
     <div class="glass-panel" style="margin-bottom: 1.5rem;">
-      <h1 style="text-align:center; color: var(--primary); font-size:2.5rem;">${t.dashboardTitle}</h1>
+      <h1 style="text-align:center; color: var(--primary); font-size:2.5rem;">${escapeHtml(t.dashboardTitle)}</h1>
       <div class="stats-header">
         <div class="stat-box">
           <h2>${globalStats.netWpm}</h2>
-          <p>${t.avgWpm}</p>
+          <p>${escapeHtml(t.avgWpm)}</p>
         </div>
         <div class="stat-box">
           <h2>${globalStats.accuracy}%</h2>
-          <p>${t.accuracy}</p>
+          <p>${escapeHtml(t.accuracy)}</p>
         </div>
         <div class="stat-box">
           <h2>${globalStats.maxCombo}🔥</h2>
-          <p>${t.maxCombo}</p>
+          <p>${escapeHtml(t.maxCombo)}</p>
         </div>
       </div>
       ${problemKeysHTML}
       <div style="margin-top:1.5rem; display:flex; justify-content:center;">
-        <button class="btn-primary" onclick="openFreeMode()">${t.freeMode}</button>
+        <button class="btn-primary" id="free-mode-btn" type="button">${escapeHtml(t.freeMode)}</button>
       </div>
     </div>
-    <h2>${t.curriculum}</h2>
+    <h2>${escapeHtml(t.curriculum)}</h2>
     <div class="sessions-grid">
       ${sessionsHTML}
     </div>
   `;
 
+  document.getElementById('lang-selector')?.addEventListener('change', event => {
+    changeLanguage(event.target.value);
+  });
+  document.getElementById('ai-selector')?.addEventListener('change', event => {
+    changeAIStyle(event.target.value);
+  });
+  bindClick('free-mode-btn', openFreeMode);
+  document.querySelectorAll('.session-card.unlocked').forEach(card => {
+    card.addEventListener('click', () => startSession(Number(card.dataset.sessionId)));
+  });
   setMascotState('idle', getRandomMsg('idle'));
 }
 
@@ -410,42 +515,44 @@ window.openFreeMode = () => {
   const app = document.querySelector('#app');
   app.innerHTML = `
     <div class="stats-header" style="max-width: 600px; margin: 2rem auto;">
-      <h2 style="color:var(--primary); margin-bottom:1rem;">${t.freeMode}</h2>
-      <textarea id="free-text-input" class="card" style="width:100%; height:200px; background:rgba(0,0,0,0.2); color:white; border:1px solid var(--primary); padding:1rem; font-family:var(--font-mono); resize:none;" placeholder="${t.pasteText}"></textarea>
+      <h2 style="color:var(--primary); margin-bottom:1rem;">${escapeHtml(t.freeMode)}</h2>
+      <label for="free-text-input" class="sr-only">${escapeHtml(t.pasteText)}</label>
+      <textarea id="free-text-input" class="card free-text-input" placeholder="${escapeHtml(t.pasteText)}"></textarea>
       <div style="display:flex; gap:1rem; margin-top:1rem;">
-        <button class="btn-primary" onclick="startFreeMode()">${t.startFree}</button>
-        <button class="btn-secondary" onclick="renderDashboard()">${t.abort}</button>
+        <button class="btn-primary" id="start-free-btn" type="button">${escapeHtml(t.startFree)}</button>
+        <button class="btn-secondary" id="free-abort-btn" type="button">${escapeHtml(t.abort)}</button>
       </div>
     </div>
   `;
+
+  bindClick('start-free-btn', startFreeMode);
+  bindClick('free-abort-btn', goHome);
+  document.getElementById('free-text-input')?.focus();
 };
 
 window.startFreeMode = () => {
-  const text = document.getElementById('free-text-input').value.trim();
+  const text = normalizeText(document.getElementById('free-text-input').value.trim());
   if (!text) return;
+  stopActiveSession();
   currentSession = { id: 0, title: 'Free Mode', text: text };
   currentText = text;
-  typedText = '';
-  startTime = null;
-  errors = 0;
-  currentCombo = 0;
-  sessionMaxCombo = 0;
-  sessionMissedKeys = {};
+  resetPracticeState();
   renderPractice();
   document.addEventListener('keydown', handleTyping);
   setMascotState('typing', getRandomMsg('idle'));
 };
 
 window.startSession = (id) => {
-  const sessions = ALL_SESSIONS[currentLanguage];
-  currentSession = sessions.find(s => s.id === id);
-  currentText = currentSession.text;
-  typedText = '';
-  errors = 0;
-  currentCombo = 0;
-  sessionMaxCombo = 0;
-  sessionMissedKeys = {};
-  startTime = null;
+  stopActiveSession();
+
+  if (id === 0) {
+    currentSession = { id: 0, title: 'Free Mode', text: currentText };
+  } else {
+    const sessions = ALL_SESSIONS[currentLanguage];
+    currentSession = sessions.find(s => s.id === id);
+    currentText = normalizeText(currentSession.text);
+  }
+  resetPracticeState();
   renderPractice();
   document.addEventListener('keydown', handleTyping);
   setMascotState('typing', getRandomMsg('idle'));
@@ -462,7 +569,7 @@ function renderPractice(shakeError = false, showCombo = false) {
     } else if (i === typedText.length) {
       charClass += ' current';
     }
-    textHTML += `<span class="${charClass}">${currentText[i]}</span>`;
+    textHTML += `<span class="${charClass}">${escapeHtml(currentText[i])}</span>`;
   }
 
   let elapsed = startTime ? (Date.now() - startTime) / 60000 : 0;
@@ -484,7 +591,7 @@ function renderPractice(shakeError = false, showCombo = false) {
 
   app.innerHTML = `
     <div class="typing-header" style="margin-bottom: 1rem;">
-      <button class="btn-secondary" onclick="goHome()">${t.abort}</button>
+      <button class="btn-secondary" id="practice-abort-btn" type="button">${escapeHtml(t.abort)}</button>
       <div style="display:flex; gap:2rem; align-items:center;">
         <div style="font-family:var(--font-mono); font-size:1.5rem; color:var(--on-surface-variant);">${timeStr}</div>
         <div style="text-align:right;">
@@ -503,11 +610,12 @@ function renderPractice(shakeError = false, showCombo = false) {
   `;
 
   if (typedText.length < currentText.length) {
-    const nextChar = currentText[typedText.length].toLowerCase();
-    const charCode = nextChar === ' ' ? 'space' : nextChar;
+    const charCode = getKeyboardDataKey(currentText[typedText.length]);
     const keyEl = document.querySelector(`.key[data-key="${charCode.replace(/"/g, '&quot;')}"]`);
     if (keyEl) keyEl.classList.add('active');
   }
+
+  bindClick('practice-abort-btn', goHome);
 }
 
 function renderKeyboard() {
@@ -517,7 +625,7 @@ function renderKeyboard() {
     html += `<div class="row row-${index + 1}">`;
     row.forEach(key => {
       let dataKey = key === 'SPACE' ? 'space' : key.toLowerCase();
-      html += `<div class="key" data-key="${dataKey.replace(/"/g, '&quot;')}">${key}</div>`;
+      html += `<div class="key" data-key="${escapeHtml(dataKey)}">${escapeHtml(key)}</div>`;
     });
     html += `</div>`;
   });
@@ -526,7 +634,7 @@ function renderKeyboard() {
 }
 
 function handleTyping(e) {
-  if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta' || e.key === 'Backspace' || e.key === 'Enter') return;
+  if (e.isComposing || IGNORED_TYPING_KEYS.has(e.key) || e.key.length !== 1) return;
   if (!startTime) {
     startTime = Date.now();
     setMascotState('typing', getRandomMsg('idle'));
@@ -541,7 +649,9 @@ function handleTyping(e) {
   let isError = false;
   let showComboPopup = false;
 
-  if (e.key !== expectedChar) {
+  const typedChar = normalizeText(e.key);
+
+  if (typedChar !== expectedChar) {
     errors++;
     isError = true;
     currentCombo = 0;
@@ -570,38 +680,41 @@ function handleTyping(e) {
     }
   }
 
-  typedText += e.key;
+  typedText += typedChar;
   renderPractice(isError, showComboPopup);
 
   if (typedText.length === currentText.length) {
     clearInterval(timerInterval);
+    timerInterval = null;
     document.removeEventListener('keydown', handleTyping);
-    setTimeout(showResults, 800);
+    resultsTimeout = setTimeout(showResults, 800);
   }
 }
 
 function showResults() {
   clearInterval(timerInterval);
+  timerInterval = null;
+  resultsTimeout = null;
   let elapsed = (Date.now() - startTime) / 60000;
   let rawWords = currentText.length / 5;
   let rawWpm = Math.round(rawWords / elapsed);
   let netWpm = Math.max(0, Math.round((rawWords - (errors/5)) / elapsed));
   let sessionAcc = Math.max(0, Math.round(((currentText.length - errors) / currentText.length) * 100));
 
-  if (globalStats.sessionsCompleted === 0) {
-    globalStats.wpm = rawWpm;
-    globalStats.netWpm = netWpm;
-    globalStats.accuracy = sessionAcc;
-  } else {
-    globalStats.wpm = Math.round((globalStats.wpm + rawWpm) / 2);
-    globalStats.netWpm = Math.round((globalStats.netWpm + netWpm) / 2);
-    globalStats.accuracy = Math.round((globalStats.accuracy + sessionAcc) / 2);
-  }
+  globalStats.totalRawWpm += rawWpm;
+  globalStats.totalNetWpm += netWpm;
+  globalStats.totalAccuracy += sessionAcc;
   globalStats.sessionsCompleted++;
+  globalStats.wpm = Math.round(globalStats.totalRawWpm / globalStats.sessionsCompleted);
+  globalStats.netWpm = Math.round(globalStats.totalNetWpm / globalStats.sessionsCompleted);
+  globalStats.accuracy = Math.round(globalStats.totalAccuracy / globalStats.sessionsCompleted);
+
+  const t = TRANSLATIONS[currentLanguage];
   
   const sessions = ALL_SESSIONS[currentLanguage];
   if (currentSession.id !== 0 && currentSession.id < sessions.length) {
-      sessions[currentSession.id].unlocked = true;
+    const nextSession = sessions.find(session => session.id === currentSession.id + 1);
+    if (nextSession) nextSession.unlocked = true;
   }
 
   const sortedSessionProblems = Object.entries(sessionMissedKeys)
@@ -612,53 +725,55 @@ function showResults() {
   if (sortedSessionProblems.length > 0) {
     problemKeysHTML = `
       <div style="margin-top:2rem;">
-        <h3 style="color:var(--on-surface-variant);">Problem Keys</h3>
+        <h3 style="color:var(--on-surface-variant);">${escapeHtml(t.sessionProblemKeys)}</h3>
         <div class="problem-keys-container">
-          ${sortedSessionProblems.map(([k, count]) => `<div class="problem-key-badge">${k === ' ' ? 'SPACE' : k} (${count})</div>`).join('')}
+          ${sortedSessionProblems.map(([k, count]) => `<div class="problem-key-badge">${escapeHtml(k === ' ' ? 'SPACE' : k.toUpperCase())} (${count})</div>`).join('')}
         </div>
       </div>
     `;
   }
 
-  const t = TRANSLATIONS[currentLanguage];
   const app = document.querySelector('#app');
   app.innerHTML = `
     <div class="glass-panel" style="text-align:center;">
-      <h1 style="color:var(--primary); font-size:3.5rem; margin-bottom: 2rem;">${t.sessionComplete}</h1>
+      <h1 style="color:var(--primary); font-size:3.5rem; margin-bottom: 2rem;">${escapeHtml(t.sessionComplete)}</h1>
       <div class="stats-header" style="justify-content:center;">
         <div class="stat-box">
           <h2 style="font-size:4.5rem;">${netWpm}</h2>
-          <p>${t.avgWpm}</p>
+          <p>${escapeHtml(t.avgWpm)}</p>
         </div>
         <div class="stat-box">
           <h2 style="font-size:4.5rem;">${sessionAcc}%</h2>
-          <p>${t.accuracy}</p>
+          <p>${escapeHtml(t.accuracy)}</p>
         </div>
         <div class="stat-box error-box">
           <h2 style="font-size:4.5rem;">${errors}</h2>
-          <p>${t.errors}</p>
+          <p>${escapeHtml(t.errors)}</p>
         </div>
       </div>
       
       <div class="stats-header" style="justify-content:center; margin-top:2rem;">
         <div class="stat-box" style="flex:0; min-width: 150px;">
           <h2 style="font-size:2.5rem; color:var(--on-surface-variant); text-shadow:none;">${rawWpm}</h2>
-          <p>${t.rawWpm}</p>
+          <p>${escapeHtml(t.rawWpm)}</p>
         </div>
         <div class="stat-box" style="flex:0; min-width: 150px;">
           <h2 style="font-size:2.5rem; color:#ffb74d; text-shadow:0 0 12px rgba(255,183,77,0.4);">🔥 ${sessionMaxCombo}</h2>
-          <p>${t.maxCombo}</p>
+          <p>${escapeHtml(t.maxCombo)}</p>
         </div>
       </div>
 
       ${problemKeysHTML}
 
       <div style="margin-top: 3rem; display:flex; gap:1rem; justify-content:center;">
-        <button class="btn-secondary" onclick="startSession(${currentSession.id})">${t.retry}</button>
-        <button class="btn-primary" onclick="goHome()">${t.dashboard}</button>
+        <button class="btn-secondary" id="retry-session-btn" type="button">${escapeHtml(t.retry)}</button>
+        <button class="btn-primary" id="results-dashboard-btn" type="button">${escapeHtml(t.dashboard)}</button>
       </div>
     </div>
   `;
+
+  bindClick('retry-session-btn', () => startSession(currentSession.id));
+  bindClick('results-dashboard-btn', goHome);
 
   if (sessionAcc >= 90) {
     setMascotState('idle', getRandomMsg('finishGood'));
@@ -668,8 +783,8 @@ function showResults() {
 }
 
 window.goHome = () => {
-  clearInterval(timerInterval);
-  document.removeEventListener('keydown', handleTyping);
+  stopActiveSession();
+  currentSession = null;
   renderDashboard();
 };
 
